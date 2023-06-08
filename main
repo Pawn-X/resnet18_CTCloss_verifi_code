@@ -1,0 +1,205 @@
+import os
+import torch
+import pandas as pb
+import torchvision.transforms as transforms
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from PIL import Image
+from torch.utils.data import Subset
+from torchvision import models
+import warnings
+import itertools
+
+# parameter----------------------------------------------------------------------------
+batch_size = 20
+learning_rate = 0.001
+EPOCH = 30
+target_len = 4
+receptive_field_num = 12
+
+# put model on gpu----------------------------------------------------------------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# set char-----------------------------------------------------------------------------
+CHARS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+         'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+         'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+         'u', 'v', 'w', 'x', 'y', 'z',
+         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+         'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
+         'U', 'V', 'W', 'X', 'Y', 'Z', '_'
+         ]
+
+
+# 将标志转化为对应idx---------------------------------------------------------------
+def label_to_vec(label):
+    # 将len为4的标志（其中包含大小写英文，数字）转化为张量（4*62）
+    vector = torch.zeros(4)
+    for i in range(len(label)):
+        if '0' <= label[i] <= '9':
+            num = ord(label[i]) - ord('0')
+            vector[i] = num
+
+        elif 'a' <= label[i] <= 'z':
+            num = ord(label[i]) - ord('a') + 10
+            vector[i] = num
+
+        elif 'A' <= label[i] <= 'Z':
+            num = ord(label[i]) - ord('A') + 36
+            vector[i] = num
+        elif label[i] == '_':
+            vector[i] = len(CHARS) - 1
+        else:
+            warnings.warn('wrong label')
+
+    return vector
+
+
+
+# construct dataset class-------------------------------------------------------------
+class Mydataset(Dataset):
+    def __init__(self, img_path, label_path, transform):
+        super(Mydataset, self).__init__()
+        self.img_path = img_path
+        # 读取存放标志的文件
+        self.label = pb.read_csv(label_path)
+        self.transform = transform
+        # 得到存放图片名称的列表
+        self.img_list = list(os.walk(img_path))[0][-1]
+
+    def __len__(self):
+        return len(self.img_list)
+
+    def __getitem__(self, item):
+        # 获取item对应的图片名
+        img_name = self.img_list[item]
+        # 读取图片，图片大小为（40，120，3）
+        img = Image.open(os.path.join(self.img_path, img_name))
+        # 对图片进行预处理
+        if self.transform:
+            img = self.transform(img)
+
+        '''求出图片对应label'''
+        # 通过截取图片名定位label
+        img_num = int(img_name[:-4])
+        label = self.label.loc[img_num - 1, 'label']
+        # 通过查找对应ID值定位label
+        # label = self.label.loc[self.label['ID'] == img_name, ['label']]
+        # label = label.loc[label.index[0], 'label']
+        # label = one_hot.label_to_vec(label)
+        label = label_to_vec(label)
+
+        return img, label
+
+
+# 数据预处理，通过计算训练集的平均值和标准差分别为[0.5347096  0.52021354 0.5204144 ] [0.24421619 0.24117489 0.23763582]
+transform = transforms.Compose([transforms.ToTensor(),
+                                transforms.Normalize(mean=(0.5347096, 0.52021354, 0.5204144),
+                                                     std=(0.24421619, 0.24117489, 0.23763582))])
+# 创建数据集--------------------------------------------------------------------------------------------
+img_path = 'D:\\Projects\\verifi_code_data\\data\\train'
+label_path = 'D:\\Projects\\verifi_code_data\\data\\train_label.csv'
+dat = Mydataset(img_path, label_path, transform)
+
+# 将数据集分为训练集和测试集--------------------------------------------------------------------------------
+train_dataset = Subset(dat, [i for i in range(4500)])
+test_dataset = Subset(dat, [i for i in range(4500, 5000)])
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+
+# 构建网络------------------------------------------------------------------------------------------------
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        # 使用 resnet18 模型，将输出的类别数设为 4 * 62
+        # 一个字母大小写，并且加上0-9，需要输出4个，所以4*62
+        self.resnet18 = models.resnet18(num_classes=receptive_field_num * len(CHARS))
+
+    def forward(self, x):
+        # 将输入 x 经过 resnet18 模型的处理
+        x = self.resnet18(x)
+        return x
+
+
+# 将output的维度大小转换为适合ctc_loss的大小
+def output_transform(vec, batch_size, output_len, chars_len):
+    vec = vec.reshape(shape=(batch_size, output_len, chars_len))
+    vec = vec.permute(1, 0, 2)
+    return vec
+
+
+# 实例化网络，并创建损失函数和优化器---------------------------------------------------------
+model = Net()
+model = model.to(device)
+# 定义损失函数
+criterion = nn.CTCLoss(blank=len(CHARS)-1)
+# criterion = nn.CrossEntropyLoss()
+criterion = criterion.to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+out_len = torch.full(size=(batch_size,), fill_value=receptive_field_num, dtype=torch.long)
+tar_len = torch.full(size=(batch_size,), fill_value=target_len, dtype=torch.long)
+
+
+# 定义训练函数------------------------------------------------------------
+def train(epoch):
+    running_loss = 0
+    for inputs, target in train_loader:
+        # inputs, target = data
+        inputs = inputs.to(device)
+        target = target.to(device)
+        outputs = model(inputs)
+        outputs = output_transform(outputs, batch_size, receptive_field_num, len(CHARS)).log_softmax(2).requires_grad_()
+        # target = target.view(-1)
+        loss = criterion(outputs, target, out_len, tar_len)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    print('[%d / %d]: running loss: %.6f' % (epoch + 1, EPOCH, running_loss))
+
+
+# 定义测试函数--------------------------------------------------------------------
+def test(epoch):
+    correct = 0
+    with torch.no_grad():  # 测试集不用算梯度
+        for data in test_loader:
+            images, labels = data
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            outputs = outputs.reshape(shape=(batch_size, receptive_field_num, len(CHARS)))
+            for i in range(outputs.shape[0]):
+                label = ''
+                final = ''
+                output_result = outputs[i,:,:]
+                output_result = torch.argmax(output_result, dim=1)
+                label_mid = [CHARS[i] for i in output_result if CHARS[i] != '_']
+                for key, _ in itertools.groupby(label_mid):
+                    final += key
+                for idx in labels[i]:
+                    label += CHARS[int(idx)]
+                if final == label:
+                    correct += 1
+            # correct += (pred == labels).sum().item()
+    acc = correct / len(test_loader.dataset)
+    print('[%d / %d]: Accuracy on test set: %.2f %% ' % (epoch + 1, EPOCH, 100 * acc))  # 求测试的准确率，正确数/总数
+    return acc
+
+
+# main fuc----------------------------------------------------------------------------------------
+if __name__ == '__main__':
+    acc_list_test = []
+    for epoch in range(EPOCH):
+        train(epoch)
+        acc_test = test(epoch)
+        acc_list_test.append(acc_test)
+
+    plt.plot(acc_list_test)
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy On TestSet')
+    plt.show()
