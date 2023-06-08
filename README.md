@@ -1,0 +1,2 @@
+# resnet18_CTCloss_verifi_code
+利用resnet18网络及CTCloss对验证码进行识别
